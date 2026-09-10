@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+.venv/
+venv/
+
+# Local API response/debug captures
+a.json
+s.json
+analyze_test.json
+search_test.json
+
