@@ -1,0 +1,8 @@
+{
+  "name": "labelscan-blinkit-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "impit": "0.14.5"
+  }
+}

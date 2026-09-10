@@ -14,12 +14,10 @@
 import json
 import os
 import re
-import secrets
+import subprocess
 import threading
-import uuid
 
 import requests
-from curl_cffi import requests as browser_requests
 from flask import Flask, jsonify, request, render_template_string
 
 # ---------------------------------------------------------------- config ----
@@ -189,71 +187,65 @@ TIER_META = {
 }
 
 # ------------------------------------------------------------- blinkit api --
-# Blinkit is protected by Cloudflare TLS fingerprinting. curl_cffi makes the
-# request with a real Chrome-like TLS handshake; ordinary requests/cloudscraper
-# can still receive a 403 even when every HTTP header looks correct.
-_BLINKIT_BASE = "https://blinkit.com"
-_BLINKIT_REQ_KEY = os.environ.get(
-    "BLINKIT_REQ_KEY", "c0e6868e-1180-400c-be51-f473479f1f0a"
-)
-_BLINKIT_DEVICE_ID = secrets.token_hex(8)
-_BLINKIT_SESSION_UUID = str(uuid.uuid4())
-_BLINKIT_AUTH_KEY = None
+# Blinkit is protected by Cloudflare TLS fingerprinting. A tiny persistent Node
+# bridge uses impit, whose Chrome TLS handshake works where Python HTTP clients
+# are rejected before Blinkit even creates an anonymous session.
 _BLINKIT_LOCK = threading.RLock()
-_scraper = browser_requests.Session(impersonate="chrome")
-_BLINKIT_HEADERS = {
-    "app_client": "consumer_web",
-    "platform": "desktop_web",
-    "lat": BLINKIT_LAT,
-    "lon": BLINKIT_LON,
-    "web_app_version": "1008010016",
-    "rn_bundle_version": "1009003012",
-    "app_version": "52434332",
-    "x-age-consent-granted": "false",
-    "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9",
-    "origin": _BLINKIT_BASE,
-    "referer": f"{_BLINKIT_BASE}/",
-    "device_id": _BLINKIT_DEVICE_ID,
-    "session_uuid": _BLINKIT_SESSION_UUID,
-}
+_BLINKIT_BRIDGE = None
 
 
-def _blinkit_auth_key():
-    """Create the anonymous device session required by Blinkit's web API."""
-    global _BLINKIT_AUTH_KEY
-    if _BLINKIT_AUTH_KEY:
-        return _BLINKIT_AUTH_KEY
-
-    r = _scraper.get(
-        f"{_BLINKIT_BASE}/v2/accounts/auth_key/",
-        headers={**_BLINKIT_HEADERS, "req_key": _BLINKIT_REQ_KEY},
-        timeout=30,
+def _start_blinkit_bridge():
+    global _BLINKIT_BRIDGE
+    root = os.path.dirname(os.path.abspath(__file__))
+    node = os.environ.get("BLINKIT_NODE_BINARY", "node")
+    _BLINKIT_BRIDGE = subprocess.Popen(
+        [node, os.path.join(root, "blinkit_bridge.mjs")],
+        cwd=root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
     )
-    r.raise_for_status()
-    _BLINKIT_AUTH_KEY = r.json().get("auth_key")
-    if not _BLINKIT_AUTH_KEY:
-        raise RuntimeError("Blinkit did not issue an anonymous session key")
-    return _BLINKIT_AUTH_KEY
+    return _BLINKIT_BRIDGE
+
+
+def _bridge_call(payload):
+    global _BLINKIT_BRIDGE
+    for attempt in range(2):
+        proc = _BLINKIT_BRIDGE
+        if proc is None or proc.poll() is not None:
+            proc = _start_blinkit_bridge()
+        try:
+            proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError("Blinkit bridge exited unexpectedly")
+            result = json.loads(line)
+            if result.get("ok"):
+                return result.get("data")
+            status = result.get("status") or "request error"
+            raise RuntimeError(f"Blinkit {status}: {result.get('error', 'request failed')}")
+        except (BrokenPipeError, OSError, json.JSONDecodeError):
+            if proc.poll() is None:
+                proc.terminate()
+            _BLINKIT_BRIDGE = None
+            if attempt:
+                raise RuntimeError("Blinkit transport could not be restarted")
 
 
 def _blinkit_request(method, path, *, params=None, json_body=None):
     """Call Blinkit with one consistent Chrome-like anonymous session."""
     with _BLINKIT_LOCK:
-        headers = {
-            **_BLINKIT_HEADERS,
-            "auth_key": _blinkit_auth_key(),
-        }
-        r = _scraper.request(
-            method,
-            f"{_BLINKIT_BASE}{path}",
-            params=params,
-            json=json_body,
-            headers=headers,
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
+        return _bridge_call({
+            "method": method,
+            "path": path,
+            "params": params or {},
+            "jsonBody": json_body,
+            "lat": BLINKIT_LAT,
+            "lon": BLINKIT_LON,
+        })
 
 
 def blinkit_search(query, limit=10):

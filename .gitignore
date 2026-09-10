@@ -4,10 +4,10 @@ __pycache__/
 .env.*
 .venv/
 venv/
+node_modules/
 
 # Local API response/debug captures
 a.json
 s.json
 analyze_test.json
 search_test.json
-
