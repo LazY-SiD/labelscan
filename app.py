@@ -14,9 +14,12 @@
 import json
 import os
 import re
+import secrets
+import threading
+import uuid
 
-import cloudscraper
 import requests
+from curl_cffi import requests as browser_requests
 from flask import Flask, jsonify, request, render_template_string
 
 # ---------------------------------------------------------------- config ----
@@ -186,51 +189,130 @@ TIER_META = {
 }
 
 # ------------------------------------------------------------- blinkit api --
-_scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "desktop": True}
+# Blinkit is protected by Cloudflare TLS fingerprinting. curl_cffi makes the
+# request with a real Chrome-like TLS handshake; ordinary requests/cloudscraper
+# can still receive a 403 even when every HTTP header looks correct.
+_BLINKIT_BASE = "https://blinkit.com"
+_BLINKIT_REQ_KEY = os.environ.get(
+    "BLINKIT_REQ_KEY", "c0e6868e-1180-400c-be51-f473479f1f0a"
 )
+_BLINKIT_DEVICE_ID = secrets.token_hex(8)
+_BLINKIT_SESSION_UUID = str(uuid.uuid4())
+_BLINKIT_AUTH_KEY = None
+_BLINKIT_LOCK = threading.RLock()
+_scraper = browser_requests.Session(impersonate="chrome")
 _BLINKIT_HEADERS = {
     "app_client": "consumer_web",
-    "content-type": "application/json",
+    "platform": "desktop_web",
     "lat": BLINKIT_LAT,
     "lon": BLINKIT_LON,
     "web_app_version": "1008010016",
-    "origin": "https://blinkit.com",
-    "referer": "https://blinkit.com/",
+    "rn_bundle_version": "1009003012",
+    "app_version": "52434332",
+    "x-age-consent-granted": "false",
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "origin": _BLINKIT_BASE,
+    "referer": f"{_BLINKIT_BASE}/",
+    "device_id": _BLINKIT_DEVICE_ID,
+    "session_uuid": _BLINKIT_SESSION_UUID,
 }
+
+
+def _blinkit_auth_key():
+    """Create the anonymous device session required by Blinkit's web API."""
+    global _BLINKIT_AUTH_KEY
+    if _BLINKIT_AUTH_KEY:
+        return _BLINKIT_AUTH_KEY
+
+    r = _scraper.get(
+        f"{_BLINKIT_BASE}/v2/accounts/auth_key/",
+        headers={**_BLINKIT_HEADERS, "req_key": _BLINKIT_REQ_KEY},
+        timeout=30,
+    )
+    r.raise_for_status()
+    _BLINKIT_AUTH_KEY = r.json().get("auth_key")
+    if not _BLINKIT_AUTH_KEY:
+        raise RuntimeError("Blinkit did not issue an anonymous session key")
+    return _BLINKIT_AUTH_KEY
+
+
+def _blinkit_request(method, path, *, params=None, json_body=None):
+    """Call Blinkit with one consistent Chrome-like anonymous session."""
+    with _BLINKIT_LOCK:
+        headers = {
+            **_BLINKIT_HEADERS,
+            "auth_key": _blinkit_auth_key(),
+        }
+        r = _scraper.request(
+            method,
+            f"{_BLINKIT_BASE}{path}",
+            params=params,
+            json=json_body,
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
 
 
 def blinkit_search(query, limit=10):
     """Search Blinkit. Returns [{id, name, brand, price, mrp, variant, image}]."""
-    r = _scraper.post(
-        "https://blinkit.com/v1/layout/search",
-        params={"q": query},
-        headers=_BLINKIT_HEADERS,
-        timeout=30,
+    data = _blinkit_request(
+        "POST",
+        "/v1/layout/search",
+        params={"q": query, "search_type": "type_to_search"},
+        json_body={
+            "applied_filters": None,
+            "sort": "",
+            "previous_search_query": query,
+        },
     )
-    r.raise_for_status()
-    data = r.json()
 
     products = []
     seen = set()
 
+    def text(v):
+        if isinstance(v, str):
+            return v
+        return (v or {}).get("text", "") if isinstance(v, dict) else ""
+
     def walk(o):
         if isinstance(o, dict):
-            d = o.get("data")
-            if isinstance(d, dict) and "atc_action" in d and "name" in d:
-                ident = (d.get("identity") or {}).get("id")
+            candidates = [o]
+            if isinstance(o.get("data"), dict):
+                candidates.append(o["data"])
+            for d in candidates:
+                cart = ((d.get("atc_action") or {}).get("add_to_cart") or {}).get("cart_item") or {}
+                ident = d.get("product_id") or d.get("type_id") or cart.get("product_id")
+                ident = ident or (d.get("identity") or {}).get("id")
+                ident = str(ident) if ident is not None else None
+                looks_product = ident and (
+                    cart or d.get("atc_action") or d.get("normal_price")
+                    or d.get("mrp") or d.get("assets")
+                )
                 if ident and ident not in seen:
+                    if not looks_product:
+                        continue
                     seen.add(ident)
-                    cart = ((d.get("atc_action") or {}).get("add_to_cart") or {}).get("cart_item") or {}
-                    txt = lambda v: (v or {}).get("text", "") if isinstance(v, dict) else ""
+                    price = text(d.get("normal_price")) or d.get("price") or cart.get("price", "")
+                    mrp = text(d.get("mrp")) or cart.get("mrp", "")
+                    if isinstance(price, (int, float)):
+                        price = f"₹{price:g}"
+                    if isinstance(mrp, (int, float)):
+                        mrp = f"₹{mrp:g}"
                     products.append({
-                        "id": ident,
-                        "name": txt(d.get("name")),
-                        "brand": txt(d.get("brand_name")) or cart.get("brand", ""),
-                        "price": txt(d.get("normal_price")),
-                        "mrp": txt(d.get("mrp")),
-                        "variant": txt(d.get("variant")) or cart.get("unit", ""),
-                        "image": (d.get("image") or {}).get("url") or cart.get("image_url", ""),
+                        "id": str(ident),
+                        "name": text(d.get("display_name")) or text(d.get("name"))
+                                or cart.get("display_name") or cart.get("product_name")
+                                or d.get("group_name", ""),
+                        "brand": text(d.get("brand_name")) or d.get("brand") or cart.get("brand", ""),
+                        "price": price,
+                        "mrp": mrp,
+                        "variant": text(d.get("variant")) or d.get("unit") or cart.get("unit", ""),
+                        "image": (d.get("image") or {}).get("url")
+                                 or ((d.get("assets") or [{}])[0].get("image_url"))
+                                 or cart.get("image_url", ""),
                     })
             for v in o.values():
                 walk(v)
@@ -243,19 +325,22 @@ def blinkit_search(query, limit=10):
 
 
 def blinkit_product_details(product_id):
-    """Fetch PDP attributes for a product: {attributes: {title: value}, ingredients: str}."""
-    r = _scraper.post(
-        f"https://blinkit.com/v1/layout/product/{product_id}",
-        headers=_BLINKIT_HEADERS,
-        timeout=30,
+    """Fetch PDP attributes, ingredient text, and Blinkit's product gallery."""
+    data = _blinkit_request(
+        "POST",
+        f"/v1/layout/product/{product_id}",
+        json_body={},
     )
-    r.raise_for_status()
-    data = r.json()
 
     attributes = {}
+    image_urls = []
 
     def walk(o):
         if isinstance(o, dict):
+            image_url = o.get("image_url")
+            if isinstance(image_url, str) and image_url.startswith("https://"):
+                if image_url not in image_urls:
+                    image_urls.append(image_url)
             t, s = o.get("title"), o.get("subtitle")
             if isinstance(t, dict) and isinstance(s, dict):
                 title = str(t.get("text", "")).strip()
@@ -274,7 +359,7 @@ def blinkit_product_details(product_id):
     for k, v in attributes.items():
         if "ingredient" in k.lower() and len(v) > len(ingredients):
             ingredients = v
-    return attributes, ingredients
+    return attributes, ingredients, image_urls
 
 
 # -------------------------------------------------------------- ai helpers --
@@ -321,6 +406,37 @@ def ai_extract_label(image_b64, mime):
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
         ],
     }])
+
+
+def ai_extract_blinkit_gallery(image_urls):
+    """Read ingredients/macros from product-pack images supplied by Blinkit."""
+    prompt = (
+        "These are gallery images for one packaged food product listed on Blinkit. "
+        "Find the image showing the ingredient list and nutrition panel, then extract strict JSON:\n"
+        '{"ingredients": str, "macros": {"energy_kcal": number|null, '
+        '"protein_g": number|null, "carbs_g": number|null, "sugar_g": number|null, '
+        '"fat_g": number|null, "sat_fat_g": number|null, "trans_fat_g": number|null, '
+        '"fibre_g": number|null, "sodium_mg": number|null}, '
+        '"macros_basis": "per 100g"|"per serving"|"unknown"}\n'
+        "Copy every visible ingredient including INS/E-numbers. Use an empty string only if no "
+        "ingredient panel is readable. Use null for nutrition values that are not visible."
+    )
+    content = [{"type": "text", "text": prompt}]
+    # The first photo is normally the pack front; later gallery photos contain
+    # label details. Six images keeps the request quick while covering the PDP.
+    for url in image_urls[-6:]:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    return _openrouter([{"role": "user", "content": content}])
+
+
+def macros_from_ai(data):
+    macros = {}
+    for k, v in (data.get("macros") or {}).items():
+        if isinstance(v, (int, float)):
+            key = k.replace("_g", "").replace("_kcal", "").replace("_mg", "")
+            unit = "kcal" if "kcal" in k else ("mg" if "mg" in k else "g")
+            macros[key] = {"value": v, "unit": unit, "raw": f"{v} {unit}"}
+    return macros
 
 
 def ai_alternative_terms(name, ingredients):
@@ -413,15 +529,29 @@ def api_search():
 @app.route("/api/analyze/blinkit/<product_id>")
 def api_analyze_blinkit(product_id):
     try:
-        attributes, ingredients = blinkit_product_details(product_id)
+        attributes, ingredients, image_urls = blinkit_product_details(product_id)
     except Exception as e:
         return jsonify({"error": f"Could not fetch product details: {e}"}), 502
+
+    macros = macros_from_attributes(attributes)
+    macros_basis = "per 100g"
+    if not ingredients and image_urls:
+        try:
+            gallery_data = ai_extract_blinkit_gallery(image_urls)
+            ingredients = gallery_data.get("ingredients") or ""
+            image_macros = macros_from_ai(gallery_data)
+            if image_macros:
+                macros = image_macros
+                macros_basis = gallery_data.get("macros_basis", "unknown")
+        except Exception:
+            # The user still gets the clear scan-label message below when a
+            # gallery is incomplete or the vision provider is unavailable.
+            pass
 
     if not ingredients:
         return jsonify({"error": "Blinkit does not list ingredients for this product. "
                                  "Try scanning the label photo instead."}), 404
 
-    macros = macros_from_attributes(attributes)
     findings = scan_ingredients(ingredients)
     name = request.args.get("name") or product_id
     terms, alt_reason = ai_alternative_terms(name, ingredients)
@@ -431,7 +561,7 @@ def api_analyze_blinkit(product_id):
         "source": "blinkit",
         "ingredients": ingredients,
         "macros": macros,
-        "macros_basis": "per 100g",
+        "macros_basis": macros_basis,
         "findings": findings,
         "alt_terms": terms,
         "alt_reason": alt_reason,
@@ -458,12 +588,7 @@ def api_analyze_photo():
         return jsonify({"error": "No ingredient list found in the photo. "
                                  "Use a sharper close-up of the ingredients section."}), 404
 
-    macros = {}
-    for k, v in (data.get("macros") or {}).items():
-        if isinstance(v, (int, float)):
-            key = k.replace("_g", "").replace("_kcal", "").replace("_mg", "")
-            unit = "kcal" if "kcal" in k else ("mg" if "mg" in k else "g")
-            macros[key] = {"value": v, "unit": unit, "raw": f"{v} {unit}"}
+    macros = macros_from_ai(data)
 
     findings = scan_ingredients(ingredients)
     name = data.get("name") or "Scanned product"
