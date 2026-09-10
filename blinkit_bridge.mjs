@@ -4,9 +4,13 @@ import { Impit } from "impit";
 
 const BASE = "https://blinkit.com";
 const REQ_KEY = process.env.BLINKIT_REQ_KEY ?? "c0e6868e-1180-400c-be51-f473479f1f0a";
+const PROXY_URL = process.env.BLINKIT_PROXY_URL;
 const deviceId = randomBytes(8).toString("hex");
 const sessionUuid = randomUUID();
-const impit = new Impit({ browser: "chrome" });
+const impit = new Impit({
+  browser: "chrome",
+  ...(PROXY_URL ? { proxyUrl: PROXY_URL } : {}),
+});
 let authKey;
 
 const STATIC_HEADERS = {
