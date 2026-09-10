@@ -12,7 +12,21 @@ Blinkit search uses an anonymous consumer-web session and an `impit` Chrome-comp
 4. Set the `OPENROUTER_API_KEY` environment variable.
 5. Run `python app.py` and open `http://127.0.0.1:5000`.
 
-When the host's IP is blocked by Blinkit, set `BLINKIT_PROXY_URL` to an Indian residential HTTP, HTTPS, or SOCKS proxy URL. Keep proxy credentials in the server environment, never in this repository.
+When the host's IP is blocked by Blinkit, either set `BLINKIT_PROXY_URL` to one fixed
+Indian residential proxy URL or configure rotating sticky sessions with:
+
+```env
+BLINKIT_PROXY_HOST=92.204.164.15
+BLINKIT_PROXY_PORT=10000
+BLINKIT_PROXY_USER_BASE=your-user-base-without-session-suffix
+BLINKIT_PROXY_PASSWORD=your-secret
+BLINKIT_PROXY_SESSION_SECONDS=780
+```
+
+The managed configuration appends `-session-<random-id>` to the username, reuses that
+session for about 13 minutes, and rotates it on request failures. Blinkit requests are
+retried at most three times with 2- and 5-second delays. Proxy credentials remain in
+`.env` and are never logged. Do not commit `.env`.
 
 ## Deploy
 

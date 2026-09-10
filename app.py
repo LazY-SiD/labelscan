@@ -12,15 +12,26 @@
 # ============================================================================
 
 import json
+import logging
 import os
 import re
+import secrets
+import string
 import subprocess
 import threading
+import time
+from urllib.parse import quote
 
 import requests
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request, render_template_string
 
 # ---------------------------------------------------------------- config ----
+load_dotenv()
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+)
+
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 AI_MODEL           = "google/gemini-2.5-flash"
 
@@ -192,60 +203,170 @@ TIER_META = {
 # are rejected before Blinkit even creates an anonymous session.
 _BLINKIT_LOCK = threading.RLock()
 _BLINKIT_BRIDGE = None
+_BLINKIT_BRIDGE_PROXY_TOKEN = None
+_LOG = logging.getLogger("labelscan.blinkit")
 
 
-def _start_blinkit_bridge():
-    global _BLINKIT_BRIDGE
+class BlinkitBridgeError(RuntimeError):
+    def __init__(self, message, status=0):
+        super().__init__(message)
+        self.status = int(status or 0)
+
+
+class BlinkitProxyManager:
+    """Build and rotate sticky residential proxy sessions without leaking secrets."""
+
+    def __init__(self):
+        self.static_url = os.environ.get("BLINKIT_PROXY_URL", "").strip()
+        self.host = os.environ.get("BLINKIT_PROXY_HOST", "").strip()
+        self.port = os.environ.get("BLINKIT_PROXY_PORT", "").strip()
+        self.user_base = os.environ.get("BLINKIT_PROXY_USER_BASE", "").strip()
+        self.password = os.environ.get("BLINKIT_PROXY_PASSWORD", "")
+        self.max_age = max(60, int(os.environ.get("BLINKIT_PROXY_SESSION_SECONDS", "780")))
+        self.session_id = None
+        self.created_at = 0.0
+
+        supplied = (self.host, self.port, self.user_base, self.password)
+        if any(supplied) and not all(supplied):
+            raise RuntimeError(
+                "Managed Blinkit proxy configuration is incomplete; set host, port, "
+                "user base, and password"
+            )
+
+    @property
+    def managed(self):
+        return bool(self.host and self.port and self.user_base and self.password)
+
+    def _new_session(self):
+        alphabet = string.ascii_lowercase + string.digits
+        self.session_id = "".join(secrets.choice(alphabet) for _ in range(8))
+        self.created_at = time.monotonic()
+        _LOG.info("[BLINKIT] session created: %s", self.session_id)
+
+    def current(self):
+        if self.static_url:
+            return self.static_url, "static"
+        if not self.managed:
+            return None, "direct"
+
+        age = time.monotonic() - self.created_at
+        if not self.session_id or age >= self.max_age:
+            self._new_session()
+            age = 0
+        _LOG.info("[BLINKIT] proxy age: %dm", int(age // 60))
+
+        username = f"{self.user_base}-session-{self.session_id}"
+        url = (
+            f"http://{quote(username, safe='')}:{quote(self.password, safe='')}"
+            f"@{self.host}:{self.port}"
+        )
+        return url, self.session_id
+
+    def rotate(self, reason):
+        if self.managed and not self.static_url:
+            _LOG.warning("[BLINKIT] %s; rotating proxy session", reason)
+            self._new_session()
+        else:
+            _LOG.warning("[BLINKIT] %s; restarting bridge", reason)
+
+
+_BLINKIT_PROXY = BlinkitProxyManager()
+
+
+def _stop_blinkit_bridge():
+    global _BLINKIT_BRIDGE, _BLINKIT_BRIDGE_PROXY_TOKEN
+    proc = _BLINKIT_BRIDGE
+    _BLINKIT_BRIDGE = None
+    _BLINKIT_BRIDGE_PROXY_TOKEN = None
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
+def _start_blinkit_bridge(proxy_url, proxy_token):
+    global _BLINKIT_BRIDGE, _BLINKIT_BRIDGE_PROXY_TOKEN
     root = os.path.dirname(os.path.abspath(__file__))
     node = os.environ.get("BLINKIT_NODE_BINARY", "node")
+    env = os.environ.copy()
+    if proxy_url:
+        env["BLINKIT_PROXY_URL"] = proxy_url
+    else:
+        env.pop("BLINKIT_PROXY_URL", None)
     _BLINKIT_BRIDGE = subprocess.Popen(
         [node, os.path.join(root, "blinkit_bridge.mjs")],
         cwd=root,
+        env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         bufsize=1,
     )
+    _BLINKIT_BRIDGE_PROXY_TOKEN = proxy_token
     return _BLINKIT_BRIDGE
 
 
 def _bridge_call(payload):
-    global _BLINKIT_BRIDGE
-    for attempt in range(2):
-        proc = _BLINKIT_BRIDGE
-        if proc is None or proc.poll() is not None:
-            proc = _start_blinkit_bridge()
-        try:
-            proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
-            proc.stdin.flush()
-            line = proc.stdout.readline()
-            if not line:
-                raise RuntimeError("Blinkit bridge exited unexpectedly")
-            result = json.loads(line)
-            if result.get("ok"):
-                return result.get("data")
-            status = result.get("status") or "request error"
-            raise RuntimeError(f"Blinkit {status}: {result.get('error', 'request failed')}")
-        except (BrokenPipeError, OSError, json.JSONDecodeError):
-            if proc.poll() is None:
-                proc.terminate()
-            _BLINKIT_BRIDGE = None
-            if attempt:
-                raise RuntimeError("Blinkit transport could not be restarted")
+    proxy_url, proxy_token = _BLINKIT_PROXY.current()
+    proc = _BLINKIT_BRIDGE
+    if (proc is None or proc.poll() is not None
+            or _BLINKIT_BRIDGE_PROXY_TOKEN != proxy_token):
+        _stop_blinkit_bridge()
+        proc = _start_blinkit_bridge(proxy_url, proxy_token)
+    try:
+        proc.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        if not line:
+            raise BlinkitBridgeError("Blinkit bridge exited unexpectedly")
+        result = json.loads(line)
+    except (BrokenPipeError, OSError, json.JSONDecodeError) as error:
+        raise BlinkitBridgeError("Blinkit bridge transport failed") from error
+
+    if result.get("ok"):
+        _LOG.info("[BLINKIT] request succeeded")
+        return result.get("data")
+    status = int(result.get("status") or 0)
+    raise BlinkitBridgeError(
+        f"Blinkit {status or 'request error'}: {result.get('error', 'request failed')}",
+        status,
+    )
 
 
 def _blinkit_request(method, path, *, params=None, json_body=None):
     """Call Blinkit with one consistent Chrome-like anonymous session."""
     with _BLINKIT_LOCK:
-        return _bridge_call({
+        payload = {
             "method": method,
             "path": path,
             "params": params or {},
             "jsonBody": json_body,
             "lat": BLINKIT_LAT,
             "lon": BLINKIT_LON,
-        })
+        }
+        delays = (0, 2, 5)
+        last_error = None
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                return _bridge_call(payload)
+            except BlinkitBridgeError as error:
+                last_error = error
+                _stop_blinkit_bridge()
+                retryable = error.status in (0, 403, 408, 425, 429, 500, 502, 503, 504)
+                if not retryable:
+                    raise
+                if attempt == len(delays):
+                    break
+                reason = f"HTTP {error.status}" if error.status else "network/transport failure"
+                _BLINKIT_PROXY.rotate(reason)
+                _LOG.warning("[BLINKIT] retrying request (%d/%d)", attempt + 1, len(delays))
+        raise last_error
 
 
 def blinkit_search(query, limit=10):
